@@ -1,0 +1,22 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "csstats"
+version = "0.1.0"
+description = "CS2 background statistics collector"
+requires-python = ">=3.12"
+
+# Deliberately empty until Phase 0b settles the concurrency model.
+# Fill from `pip freeze` once the spike passes — see DESIGN 2026-08-10-C.
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/csstats"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
