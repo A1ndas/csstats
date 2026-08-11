@@ -263,58 +263,117 @@ def compute_player_stats(kills: pd.DataFrame,
     )
     return stats
 
-
 # ---------------------------------------------------------------- display
+
+def team_label(team: str, score: dict) -> str:
+    """'team A (started T, 7 rounds)' -- more use than a bare letter."""
+    wins = score.get("wins", {}).get(team, "?")
+    by_round = score.get("a_side_by_round", {})
+    first = by_round.get(min(by_round)) if by_round else None
+    if first:
+        started = first if team == "A" else ("CT" if first == "T" else "T")
+        return f"team {team}  (started {started}, {wins} rounds)"
+    return f"team {team}  ({wins} rounds)"
+
+
+def render_roster(players: pd.DataFrame, score: dict) -> None:
+    """Teams and names only. Used when statistics are unavailable."""
+    for team in ("A", "B"):
+        block = players[players["team"] == team]
+        if block.empty:
+            continue
+        print(f"\n{team_label(team, score)}")
+        print(f"  {'player':<20s} {'ended':>5s} {'MVP':>4s}")
+        print("  " + "-" * 31)
+        for _, r in block.iterrows():
+            mvp = "" if pd.isna(r["mvps"]) else f"{int(r['mvps']):d}"
+            flag = " *" if r["left_early"] else ""
+            print(f"  {str(r['name'])[:20]:<20s} "
+                  f"{str(r['final_side'] or '?'):>5s} {mvp:>4s}{flag}")
+
+    _render_notes(players)
+
 
 def render(stats: pd.DataFrame, players: pd.DataFrame, score: dict) -> None:
     merged = players.merge(stats, left_on="steamid", right_index=True,
                            how="left")
-    for col in ("kills", "deaths", "assists", "damage", "adr", "hs_pct"):
-        if col in merged.columns:
-            merged[col] = merged[col].fillna(0)
 
-    wins = score.get("wins", {})
-    header = (f"{'player':<20s} {'K':>4s} {'D':>4s} {'A':>4s} "
+    needed = ["kills", "deaths", "assists", "damage", "adr", "hs_pct"]
+    missing = [c for c in needed if c not in merged.columns]
+    if missing:
+        print(f"\ncompute_player_stats did not return: {missing}")
+        print("falling back to roster view")
+        render_roster(players, score)
+        return
+
+    for col in needed:
+        merged[col] = merged[col].fillna(0)
+
+    header = (f"  {'player':<20s} {'K':>4s} {'D':>4s} {'A':>4s} "
               f"{'ADR':>7s} {'HS%':>6s} {'MVP':>4s}")
 
     for team in ("A", "B"):
         block = merged[merged["team"] == team]
         if block.empty:
             continue
-        held = sorted({s for s in block["final_side"] if s})
-        print(f"\nteam {team}  ({wins.get(team, '?')} rounds, "
-              f"ended {'/'.join(held)})")
+        print(f"\n{team_label(team, score)}")
         print(header)
-        print("-" * len(header))
+        print("  " + "-" * (len(header) - 2))
 
         block = block.sort_values(["kills", "damage"], ascending=False)
         for _, r in block.iterrows():
             mvp = "" if pd.isna(r["mvps"]) else f"{int(r['mvps']):d}"
             flag = " *" if r["left_early"] else ""
-            print(f"{str(r['name'])[:20]:<20s} "
+            print(f"  {str(r['name'])[:20]:<20s} "
                   f"{int(r['kills']):>4d} {int(r['deaths']):>4d} "
                   f"{int(r['assists']):>4d} {r['adr']:>7.1f} "
                   f"{r['hs_pct']:>5.1f}% {mvp:>4s}{flag}")
 
-    unassigned = merged[merged["team"].isna()]
+    _render_notes(merged)
+
+
+def _render_notes(df: pd.DataFrame) -> None:
+    unassigned = df[df["team"].isna()]
     if not unassigned.empty:
-        print(f"\nunassigned: {list(unassigned['name'])}")
-    if merged["left_early"].any():
+        print(f"\nunassigned to a team: {list(unassigned['name'])}")
+    if df["left_early"].any():
         print("\n* not present at the final round")
 
 
 # ---------------------------------------------------------------- main
 
+def find_demo(stem: str) -> Path | None:
+    exact = EXTRACTED / f"{stem}.dem"
+    if exact.exists():
+        return exact
+    matches = [d for d in sorted(EXTRACTED.glob("*.dem")) if stem in d.stem]
+    if len(matches) == 1:
+        return matches[0]
+    print(f"{stem!r} is ambiguous" if matches else f"no demo matching {stem!r}")
+    print("available:")
+    for d in sorted(EXTRACTED.glob("*.dem")):
+        print(f"  {d.stem}")
+    return None
+
+
 def main() -> int:
-    stem = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_DEMO
-    path = EXTRACTED / f"{stem}.dem"
-    if not path.exists():
-        print(f"not found: {path}")
+    path = find_demo(sys.argv[1] if len(sys.argv) > 1 else DEFAULT_DEMO)
+    if path is None:
         return 1
 
     print(f"{path.name}")
-    data = load(path)
+
+    try:
+        data = load(path)
+    except Exception as err:
+        print(f"  parse failed: {err!r}")
+        return 1
+
     rounds = data["rounds"]
+    if not hasattr(rounds, "columns") or rounds.empty:
+        print("  no round_end data -- cannot resolve rounds or score")
+        return 1
+
     n_rounds = len(rounds)
     print(f"  rounds played: {n_rounds}")
 
@@ -325,15 +384,33 @@ def main() -> int:
         print(f"  wins by SIDE (not a score): "
               f"{rounds['winner'].value_counts().to_dict()}")
 
-    sides = side_table(data["parser"], rounds)
-    team_of = resolve_teams(sides)
-    score = match_score(rounds, sides, team_of)
-    players = roster(sides, team_of)
+    try:
+        sides = side_table(data["parser"], rounds)
+        team_of = resolve_teams(sides)
+        score = match_score(rounds, sides, team_of) if team_of else {}
+        players = roster(sides, team_of)
+    except Exception as err:
+        print(f"  team resolution failed: {err!r}")
+        return 1
+
+    if players.empty:
+        print("  no players found")
+        return 1
 
     kills = clean(data["kills"], n_rounds, "kills")
     hurt = clean(data["hurt"], n_rounds, "hurt")
 
-    stats = compute_player_stats(kills, hurt, players, n_rounds)
+    try:
+        stats = compute_player_stats(kills, hurt, players, n_rounds)
+    except NotImplementedError as err:
+        print(f"\n[stats not implemented: {err}]")
+        render_roster(players, score)
+        return 0
+    except Exception as err:
+        print(f"\ncompute_player_stats raised {err!r}")
+        render_roster(players, score)
+        return 1
+
     render(stats, players, score)
     return 0
 
