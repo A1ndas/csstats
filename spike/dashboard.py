@@ -189,12 +189,12 @@ def roster(sides: pd.DataFrame, team_of: dict) -> pd.DataFrame:
 
     if "mvps" in live.columns and live["mvps"].notna().any():
         peak = live.groupby("steamid")["mvps"].max()
-        out["mvps"] = [peak.get(s) for s in out["steamid"]]
+        out["mvps"] = [peak.get(s) for s in last.index]
     else:
         out["mvps"] = pd.NA
 
     last_tick = int(sides["tick"].max())
-    present = set(sides[sides["tick"] == last_tick]["steamid"])
+    present = {str(s) for s in sides[sides["tick"] == last_tick]["steamid"]}
     out["left_early"] = [s not in present for s in out["steamid"]]
 
     return out.reset_index(drop=True)
