@@ -181,7 +181,7 @@ def roster(sides: pd.DataFrame, team_of: dict) -> pd.DataFrame:
     last = live.groupby("steamid").last()
 
     out = pd.DataFrame({
-        "steamid": last.index,
+        "steamid": [str(s) for s in last.index],
         "name": last["name"].values,
         "final_side": [SIDE.get(t) for t in last["team_num"].values],
         "team": [team_of.get(s) for s in last.index],
@@ -225,7 +225,7 @@ def compute_player_stats(kills: pd.DataFrame,
     reported, so a filter that silently matches nothing is visible rather than
     assumed correct.
     """
-    ids = pd.Index(players["steamid"], name="steamid")
+    ids = [str(s) for s in players["steamid"]]
     stats = pd.DataFrame(index=ids)
 
     # ---- deaths: every row is exactly one death, however caused ----------
