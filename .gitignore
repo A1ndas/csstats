@@ -11,8 +11,5 @@ build/
 *.db-shm
 session_state/
 
-spike/
-!spike/.gitkeep
-
 *.dem
 *.dem.bz2
