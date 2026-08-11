@@ -214,53 +214,100 @@ def clean(df: pd.DataFrame, n_rounds: int, label: str) -> pd.DataFrame:
     return out.copy()
 
 
-# ---------------------------------------------------------------- statistics
-
 def compute_player_stats(kills: pd.DataFrame,
                          hurt: pd.DataFrame,
                          players: pd.DataFrame,
                          n_rounds: int) -> pd.DataFrame:
-    """Return one row per player, indexed by steamid (str).
+    """One row per player, indexed by steamid.
 
-    YOURS TO WRITE. Required columns: kills, deaths, assists, damage, adr,
-    hs_pct.
-
-        kills     Credited to attacker_steamid. EXCLUDE suicides
-                  (attacker == user), world deaths (attacker_steamid is NaN)
-                  and team kills (same team_num). A team kill still counts as
-                  a DEATH for the victim.
-
-        deaths    Every row per user_steamid, however caused.
-
-        assists   assister_steamid.notna() -- missing assists are NaN despite
-                  the str dtype, so never test == "". Flash assists are a
-                  SUBSET, flagged by assistedflash, not a separate field.
-
-        damage    Sum dmg_health from `hurt`, NEVER from `kills`
-                  (kills.dmg_health is the killing blow only). Exclude self
-                  and team damage.
-                  OPEN: is dmg_health clamped to remaining health, or raw
-                  including overkill? Different ADR either way. Settle by hand
-                  against one round of the in-game scoreboard.
-
-        adr       damage / rounds. A player who joined late or left early has
-                  a smaller denominator than n_rounds -- see the left_early
-                  column on `players`. This is a common source of
-                  disagreement with the in-game numbers.
-
-        hs_pct    Headshot kills / kills, same exclusions as kills.
-
-    Reindex on players['steamid'] so that zero-kill, zero-death and
-    disconnected players all still appear. groupby alone silently drops them.
+    Every metric reindexes onto the full roster, so zero-kill, zero-death and
+    disconnected players still appear. Exclusions are applied explicitly and
+    reported, so a filter that silently matches nothing is visible rather than
+    assumed correct.
     """
-    # --- worked example, to show the expected shape ---------------------
-    deaths = kills.groupby("user_steamid").size().rename("deaths")
-    stats = deaths.reindex(players["steamid"]).fillna(0).to_frame()
+    ids = pd.Index(players["steamid"], name="steamid")
+    stats = pd.DataFrame(index=ids)
 
-    # --- your work starts here -----------------------------------------
-    raise NotImplementedError(
-        "compute_player_stats: see docstring. Delete this raise as you go."
-    )
+    # ---- deaths: every row is exactly one death, however caused ----------
+    stats["deaths"] = (kills.groupby("user_steamid").size()
+                       .reindex(ids).fillna(0).astype(int))
+
+    # ---- kills: exclude world deaths, suicides and team kills ------------
+    world = kills["attacker_steamid"].isna()
+    suicide = kills["attacker_steamid"] == kills["user_steamid"]
+    teamkill = (kills["attacker_team_num"] == kills["user_team_num"]) & ~world
+
+    real = kills[~world & ~suicide & ~teamkill]
+    print(f"  kills: {len(real)} counted, excluded "
+          f"{world.sum()} world / {suicide.sum()} suicide / "
+          f"{teamkill.sum()} teamkill")
+
+    stats["kills"] = (real.groupby("attacker_steamid").size()
+                      .reindex(ids).fillna(0).astype(int))
+
+    hs = real[real["headshot"].astype(bool)]
+    stats["hs_kills"] = (hs.groupby("attacker_steamid").size()
+                         .reindex(ids).fillna(0).astype(int))
+
+    # ---- assists: notna, never == "". Exclude assists on your own team ---
+    has_assist = kills["assister_steamid"].notna()
+    team_assist = has_assist & (kills["assister_team_num"]
+                                == kills["user_team_num"])
+    assisted = kills[has_assist & ~team_assist]
+    if team_assist.sum():
+        print(f"  assists: excluded {team_assist.sum()} team assist(s)")
+
+    stats["assists"] = (assisted.groupby("assister_steamid").size()
+                        .reindex(ids).fillna(0).astype(int))
+
+    # flash assists are a SUBSET of assists, not a separate credit
+    flash = assisted[assisted["assistedflash"].astype(bool)]
+    stats["flash_assists"] = (flash.groupby("assister_steamid").size()
+                              .reindex(ids).fillna(0).astype(int))
+
+    # ---- damage: from player_hurt only, never kills.dmg_health -----------
+    h_world = hurt["attacker_steamid"].isna()
+    h_self = hurt["attacker_steamid"] == hurt["user_steamid"]
+    h_team = (hurt["attacker_team_num"] == hurt["user_team_num"]) & ~h_world
+
+    dealt = hurt[~h_world & ~h_self & ~h_team]
+    print(f"  damage: {len(dealt)} hits counted, excluded "
+          f"{h_world.sum()} world / {h_self.sum()} self / "
+          f"{h_team.sum()} team")
+
+    raw = dealt.groupby("attacker_steamid")["dmg_health"].sum()
+
+    # OPEN QUESTION: is dmg_health already the health actually removed, or the
+    # weapon's raw damage including overkill? If user_health is the victim's
+    # health BEFORE the hit, actual damage is min(dmg_health, user_health).
+    over = dealt[dealt["dmg_health"] > dealt["user_health"]]
+    if len(over):
+        clamped = (dealt.assign(
+            actual=dealt[["dmg_health", "user_health"]].min(axis=1))
+            .groupby("attacker_steamid")["actual"].sum())
+        print(f"  damage: {len(over)} hit(s) exceed victim health "
+              f"(raw total {raw.sum():.0f} vs clamped {clamped.sum():.0f}) "
+              f"-- verify against the in-game scoreboard")
+    else:
+        print("  damage: no hit exceeds victim health "
+              "(raw and clamped are identical here)")
+
+    stats["damage"] = raw.reindex(ids).fillna(0).astype(int)
+
+    # ---- derived ---------------------------------------------------------
+    stats["adr"] = stats["damage"] / max(n_rounds, 1)
+    stats["hs_pct"] = (stats["hs_kills"] / stats["kills"].replace(0, pd.NA)
+                       * 100).fillna(0.0)
+    stats["kd"] = (stats["kills"] / stats["deaths"].replace(0, pd.NA))
+
+    # ---- reconciliation --------------------------------------------------
+    if stats["deaths"].sum() != len(kills):
+        print(f"  WARNING deaths {stats['deaths'].sum()} != "
+              f"{len(kills)} kill rows -- a victim is missing from the roster")
+    if stats["kills"].sum() != len(real):
+        print(f"  WARNING kills {stats['kills'].sum()} != {len(real)} "
+              f"-- an attacker is missing from the roster")
+
     return stats
 
 # ---------------------------------------------------------------- display
