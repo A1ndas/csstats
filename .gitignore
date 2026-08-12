@@ -10,6 +10,7 @@ build/
 *.db-wal
 *.db-shm
 session_state/
+data/
 
 *.dem
 *.dem.bz2
