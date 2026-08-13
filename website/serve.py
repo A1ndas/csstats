@@ -51,7 +51,7 @@ def list_matches(conn) -> list[dict]:
             "map_name": r["map_name"],
             "rounds": r["rounds"],
             "patch_version": r["patch_version"],
-            "score": ordered or [0, 0],
+            "score": (ordered + [0])[:2],
         })
     return out
 
@@ -345,8 +345,9 @@ class Handler(SimpleHTTPRequestHandler):
         self.wfile.write(body)
 
     def log_message(self, fmt, *args):
-        if "/api/" in (args[0] if args else ""):
-            super().log_message(fmt, *args)
+            line = " ".join(str(a) for a in args)
+            if "/api/" in line:
+                super().log_message(fmt, *args)
 
 
 def main() -> int:

@@ -36,7 +36,7 @@ function renderSidebar() {
   list.innerHTML = "";
 
   state.matches.forEach((m, i) => {
-    const [hi, lo] = m.score;
+    const [hi, lo = 0] = m.score;
     const li = el("li", "match-item");
     li.tabIndex = 0;
     li.dataset.id = m.match_id;

@@ -351,6 +351,19 @@ def resolve_teams(sides: pd.DataFrame) -> dict:
             break
     return team_of
 
+def round_end_number(row) -> int | None:
+    """Round number for a round_end row.
+
+    round_end has a native 1-based `round` column. Failing that, its
+    total_rounds_played is ALREADY the finished round's number -- the counter
+    increments before the event fires -- so no +1 here, unlike in-round events
+    such as player_death.
+    """
+    v = num(getattr(row, "round", None))
+    if v is not None:
+        return int(v)
+    v = num(getattr(row, "total_rounds_played", None))
+    return None if v is None else int(v)
 
 def classify(attacker: str | None, victim: str | None,
              a_side: str | None, v_side: str | None) -> str | None:
@@ -403,7 +416,7 @@ def extract(path: Path, conn: sqlite3.Connection) -> None:
     tick_to_round, a_side_by_round = {}, {}
 
     for r in rounds.sort_values("tick").itertuples():
-        rno = round_of(r, src)
+        rno = round_end_number(r)
         tick = int(r.tick)
         tick_to_round[tick] = rno
         grp = by_tick.get(tick)
