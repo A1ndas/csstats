@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>csstats</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<aside class="sidebar">
+  <div class="brand">
+    <span class="brand-mark"></span>
+    <span class="brand-name">csstats</span>
+  </div>
+  <nav class="nav">
+    <span class="nav-item is-active">Matches</span>
+    <span class="nav-item is-disabled">Trends<em>needs more matches</em></span>
+    <span class="nav-item is-disabled">Maps<em>needs more matches</em></span>
+  </nav>
+  <div class="sidebar-label">Match history</div>
+  <ul class="match-list" id="match-list"></ul>
+  <div class="sidebar-foot" id="sidebar-foot"></div>
+</aside>
+
+<main class="main" id="main">
+  <div class="empty" id="empty">Loading matches…</div>
+</main>
+
+<template id="tpl-match">
+  <header class="match-head">
+    <div class="match-head-top">
+      <div>
+        <div class="eyebrow" data-f="eyebrow"></div>
+        <h1 class="map" data-f="map"></h1>
+      </div>
+      <div class="scoreline">
+        <span class="score-team" data-f="team-a"></span>
+        <span class="score" data-f="score-a"></span>
+        <span class="score-sep">:</span>
+        <span class="score" data-f="score-b"></span>
+        <span class="score-team" data-f="team-b"></span>
+      </div>
+    </div>
+    <div class="timeline" data-f="timeline"></div>
+  </header>
+
+  <section class="tiles" data-f="tiles"></section>
+
+  <section class="panel">
+    <div class="panel-head">
+      <h2>Scoreboard</h2>
+      <div class="toggle">
+        <button class="toggle-btn is-on" data-adr="clamped">ADR clamped</button>
+        <button class="toggle-btn" data-adr="raw">ADR raw</button>
+      </div>
+    </div>
+    <div data-f="teams"></div>
+    <p class="note" data-f="adr-note"></p>
+  </section>
+
+  <section class="panel">
+    <div class="panel-head"><h2>Duels &amp; utility</h2></div>
+    <div data-f="detail"></div>
+  </section>
+
+  <section class="panel">
+    <div class="panel-head"><h2>Round by round</h2></div>
+    <div data-f="rounds"></div>
+  </section>
+
+  <footer class="meta" data-f="meta"></footer>
+</template>
+
+<script src="app.js"></script>
+</body>
+</html>

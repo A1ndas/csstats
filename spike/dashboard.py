@@ -1,464 +1,372 @@
-r"""Render a CS2 scoreboard from a parsed demo.
+r"""Browse extracted CS2 matches from SQLite.
 
-Run:
-    .\.venv\Scripts\python.exe spike\scoreboard.py
-    .\.venv\Scripts\python.exe spike\scoreboard.py 003835503793596793281_0144217731
+    python spike/dashboard.py            # pick a match from a list
+    python spike/dashboard.py 1          # jump straight to list entry 1
+    python spike/dashboard.py --sql      # print the metric SQL and exit
 
-Plumbing (roster, per-round sides, team resolution, score, filtering, display)
-is complete. The statistics themselves live in compute_player_stats() and are
-yours to write -- see the docstring there.
+Reads only. Run spike/extract.py first to populate the database.
 
-Key facts this encodes, all established by measurement rather than assumption:
+Every metric here is computed from raw event rows at query time, never read
+from a stored aggregate. That is deliberate: the trade window, the KAST
+definition and the ADR clamping are all tunable, so they live in SQL where
+changing them costs a re-run rather than a re-parse.
 
-  * round_end.winner is a SIDE ('CT'/'T'), not a team. Sides swap, so counting
-    winners directly yields a side split, never a match score.
-  * total_rounds_played counts COMPLETED rounds (0 during round 1), so activity
-    at >= len(rounds) is post-match and must be dropped.
-  * team_num 2 = T, 3 = CT. 1 is spectator and must never be treated as a side.
-  * Side swap points are DERIVED, never hardcoded. MR12 swaps once at 12, but
-    overtime swaps every three rounds and the format has changed before.
-  * SteamIDs are str, so store as TEXT and never compare against ints.
+ADR is reported BOTH ways -- raw dmg_health, and clamped to the victim's
+remaining health -- because which one matches the in-game scoreboard is still
+an open question. 146 of 596 hits on demo 1315 exceeded victim health, so the
+two differ by roughly a quarter. Verify against a real scoreboard and then
+collapse this to one column.
 """
+import sqlite3
 import sys
 from pathlib import Path
 
-import pandas as pd
-from demoparser2 import DemoParser
-
-EXTRACTED = Path(r"C:\Users\willi\Projects\csstats-data\extracted")
-DEFAULT_DEMO = "003836072496658907557_1315824633"
-
-PLAYER_PROPS = ["team_num", "team_name", "health", "armor_value"]
-OTHER_PROPS = ["total_rounds_played", "is_warmup_period", "game_time",
-               "round_start_time"]
-
-SIDE = {2: "T", 3: "CT"}
-PLAYING = (2, 3)     # anything else (0 unassigned, 1 spectator) is not a side
-
-
-# ---------------------------------------------------------------- loading
-
-def load(path: Path) -> dict:
-    p = DemoParser(str(path))
-    return {
-        "parser": p,
-        "kills": p.parse_event("player_death", player=PLAYER_PROPS,
-                               other=OTHER_PROPS),
-        "hurt": p.parse_event("player_hurt", player=PLAYER_PROPS,
-                              other=OTHER_PROPS),
-        "rounds": p.parse_event("round_end", other=OTHER_PROPS),
-    }
-
-
-def side_table(p: DemoParser, rounds: pd.DataFrame) -> pd.DataFrame:
-    """Every player's side and MVP count at the end of every round.
-
-    One tick query serves three purposes: per-round side resolution, the
-    player roster (as a union across all rounds, so anyone who disconnects
-    before the end is not lost), and MVP counts.
-    """
-    ticks = sorted(int(t) for t in rounds["tick"].unique())
-
-    last = None
-    for props in (["team_num", "mvps"], ["team_num"]):
-        try:
-            df = p.parse_ticks(props, ticks=ticks)
-            if "mvps" not in df.columns:
-                df["mvps"] = pd.NA
-            return df
-        except Exception as err:
-            last = err
-    raise RuntimeError(f"could not read tick data: {last!r}")
-
-
-# ------------------------------------------------------- team resolution
-
-def _team_a_side(grp: pd.DataFrame, team_of: dict) -> str | None:
-    """Which side team A held in this round, by majority vote.
-
-    Votes from team B count in reverse, so a round in which only B players
-    remain is still resolvable. Returns None only when no already-assigned
-    player was present at all.
-    """
-    votes = []
-    for r in grp.itertuples():
-        team = team_of.get(r.steamid)
-        side = SIDE.get(r.team_num)
-        if team is None or side is None:
-            continue
-        if team == "A":
-            votes.append(side)
-        else:
-            votes.append("T" if side == "CT" else "CT")
-    if not votes:
-        return None
-    return max(set(votes), key=votes.count)
-
-
-def resolve_teams(sides: pd.DataFrame) -> dict:
-    """Assign every player to team 'A' or 'B'.
-
-    Teams are rosters; sides are positions that swap. Assignment propagates
-    outward from the best-populated round, so it tolerates players who
-    disconnect early, join late, or sit out part of the match. A player is
-    only ever assigned from a round in which they were actually playing.
-    """
-    live = sides[sides["team_num"].isin(PLAYING)]
-    if live.empty:
-        return {}
-
-    by_tick = {t: g for t, g in live.groupby("tick")}
-
-    # anchor on the round with the most players present
-    anchor = max(by_tick, key=lambda t: by_tick[t]["steamid"].nunique())
-    team_of = {r.steamid: ("A" if r.team_num == 2 else "B")
-               for r in by_tick[anchor].itertuples()}
-
-    # propagate: once team A's side is known at a tick, anyone else present
-    # in that tick can be assigned from whether they match it
-    for _ in range(4):
-        added = 0
-        for grp in by_tick.values():
-            a_side = _team_a_side(grp, team_of)
-            if a_side is None:
-                continue
-            for r in grp.itertuples():
-                if r.steamid in team_of:
-                    continue
-                mine = SIDE.get(r.team_num)
-                team_of[r.steamid] = "A" if mine == a_side else "B"
-                added += 1
-        if not added:
-            break
-
-    return team_of
-
-
-def match_score(rounds: pd.DataFrame, sides: pd.DataFrame,
-                team_of: dict) -> dict:
-    """Round wins per roster, with derived swap points."""
-    live = sides[sides["team_num"].isin(PLAYING)]
-    by_tick = {t: g for t, g in live.groupby("tick")}
-
-    wins = {"A": 0, "B": 0}
-    a_side_by_round = {}
-    flips, prev, unresolved = [], None, []
-
-    for r in rounds.sort_values("tick").itertuples():
-        rno = int(getattr(r, "round", r.total_rounds_played + 1))
-        grp = by_tick.get(int(r.tick))
-        a_side = _team_a_side(grp, team_of) if grp is not None else None
-
-        if a_side is None:
-            unresolved.append(rno)
-            continue
-
-        a_side_by_round[rno] = a_side
-        if prev is not None and a_side != prev:
-            flips.append(rno)
-        prev = a_side
-
-        wins["A" if r.winner == a_side else "B"] += 1
-
-    print(f"  rosters: A={sum(v == 'A' for v in team_of.values())} "
-          f"B={sum(v == 'B' for v in team_of.values())}")
-    print(f"  side flips at round: {flips or 'none'}")
-    if unresolved:
-        print(f"  unresolved rounds: {unresolved}")
-    print(f"  SCORE  A {wins['A']} - {wins['B']} B")
-
-    return {"wins": wins, "a_side_by_round": a_side_by_round}
-
-
-def roster(sides: pd.DataFrame, team_of: dict) -> pd.DataFrame:
-    """One row per player ever seen, with final side and MVP count.
-
-    Built from the union across all rounds so that anyone who disconnected
-    mid-match still appears -- they played, they have statistics, and the
-    in-game scoreboard would show them too.
-    """
-    live = sides[sides["team_num"].isin(PLAYING)].sort_values("tick")
-    last = live.groupby("steamid").last()
-
-    out = pd.DataFrame({
-        "steamid": [str(s) for s in last.index],
-        "name": last["name"].values,
-        "final_side": [SIDE.get(t) for t in last["team_num"].values],
-        "team": [team_of.get(s) for s in last.index],
-    })
-
-    if "mvps" in live.columns and live["mvps"].notna().any():
-        peak = live.groupby("steamid")["mvps"].max()
-        out["mvps"] = [peak.get(s) for s in last.index]
-    else:
-        out["mvps"] = pd.NA
-
-    last_tick = int(sides["tick"].max())
-    present = {str(s) for s in sides[sides["tick"] == last_tick]["steamid"]}
-    out["left_early"] = [s not in present for s in out["steamid"]]
-
-    return out.reset_index(drop=True)
-
-
-# ---------------------------------------------------------------- filtering
-
-def clean(df: pd.DataFrame, n_rounds: int, label: str) -> pd.DataFrame:
-    """Drop warmup and post-match activity."""
-    before = len(df)
-    out = df[~df["is_warmup_period"].astype(bool)]
-    out = out[out["total_rounds_played"] < n_rounds]
-    dropped = before - len(out)
-    if dropped:
-        print(f"  {label}: filtered {dropped} of {before} "
-              f"(warmup / post-match)")
-    return out.copy()
-
-
-def compute_player_stats(kills: pd.DataFrame,
-                         hurt: pd.DataFrame,
-                         players: pd.DataFrame,
-                         n_rounds: int) -> pd.DataFrame:
-    """One row per player, indexed by steamid.
-
-    Every metric reindexes onto the full roster, so zero-kill, zero-death and
-    disconnected players still appear. Exclusions are applied explicitly and
-    reported, so a filter that silently matches nothing is visible rather than
-    assumed correct.
-    """
-    ids = [str(s) for s in players["steamid"]]
-    stats = pd.DataFrame(index=ids)
-
-    # ---- deaths: every row is exactly one death, however caused ----------
-    stats["deaths"] = (kills.groupby("user_steamid").size()
-                       .reindex(ids).fillna(0).astype(int))
-
-    # ---- kills: exclude world deaths, suicides and team kills ------------
-    world = kills["attacker_steamid"].isna()
-    suicide = kills["attacker_steamid"] == kills["user_steamid"]
-    teamkill = (kills["attacker_team_num"] == kills["user_team_num"]) & ~world
-
-    real = kills[~world & ~suicide & ~teamkill]
-    print(f"  kills: {len(real)} counted, excluded "
-          f"{world.sum()} world / {suicide.sum()} suicide / "
-          f"{teamkill.sum()} teamkill")
-
-    stats["kills"] = (real.groupby("attacker_steamid").size()
-                      .reindex(ids).fillna(0).astype(int))
-
-    hs = real[real["headshot"].astype(bool)]
-    stats["hs_kills"] = (hs.groupby("attacker_steamid").size()
-                         .reindex(ids).fillna(0).astype(int))
-
-    # ---- assists: notna, never == "". Exclude assists on your own team ---
-    has_assist = kills["assister_steamid"].notna()
-    team_assist = has_assist & (kills["assister_team_num"]
-                                == kills["user_team_num"])
-    assisted = kills[has_assist & ~team_assist]
-    if team_assist.sum():
-        print(f"  assists: excluded {team_assist.sum()} team assist(s)")
-
-    stats["assists"] = (assisted.groupby("assister_steamid").size()
-                        .reindex(ids).fillna(0).astype(int))
-
-    # flash assists are a SUBSET of assists, not a separate credit
-    flash = assisted[assisted["assistedflash"].astype(bool)]
-    stats["flash_assists"] = (flash.groupby("assister_steamid").size()
-                              .reindex(ids).fillna(0).astype(int))
-
-    # ---- damage: from player_hurt only, never kills.dmg_health -----------
-    h_world = hurt["attacker_steamid"].isna()
-    h_self = hurt["attacker_steamid"] == hurt["user_steamid"]
-    h_team = (hurt["attacker_team_num"] == hurt["user_team_num"]) & ~h_world
-
-    dealt = hurt[~h_world & ~h_self & ~h_team]
-    print(f"  damage: {len(dealt)} hits counted, excluded "
-          f"{h_world.sum()} world / {h_self.sum()} self / "
-          f"{h_team.sum()} team")
-
-    raw = dealt.groupby("attacker_steamid")["dmg_health"].sum()
-
-    # OPEN QUESTION: is dmg_health already the health actually removed, or the
-    # weapon's raw damage including overkill? If user_health is the victim's
-    # health BEFORE the hit, actual damage is min(dmg_health, user_health).
-    over = dealt[dealt["dmg_health"] > dealt["user_health"]]
-    if len(over):
-        clamped = (dealt.assign(
-            actual=dealt[["dmg_health", "user_health"]].min(axis=1))
-            .groupby("attacker_steamid")["actual"].sum())
-        print(f"  damage: {len(over)} hit(s) exceed victim health "
-              f"(raw total {raw.sum():.0f} vs clamped {clamped.sum():.0f}) "
-              f"-- verify against the in-game scoreboard")
-    else:
-        print("  damage: no hit exceeds victim health "
-              "(raw and clamped are identical here)")
-
-    stats["damage"] = raw.reindex(ids).fillna(0).astype(int)
-
-    # ---- derived ---------------------------------------------------------
-    stats["adr"] = stats["damage"] / max(n_rounds, 1)
-    stats["hs_pct"] = (stats["hs_kills"] / stats["kills"].replace(0, pd.NA)
-                       * 100).fillna(0.0)
-    stats["kd"] = (stats["kills"] / stats["deaths"].replace(0, pd.NA))
-
-    # ---- reconciliation --------------------------------------------------
-    if stats["deaths"].sum() != len(kills):
-        print(f"  WARNING deaths {stats['deaths'].sum()} != "
-              f"{len(kills)} kill rows -- a victim is missing from the roster")
-    if stats["kills"].sum() != len(real):
-        print(f"  WARNING kills {stats['kills'].sum()} != {len(real)} "
-              f"-- an attacker is missing from the roster")
-
-    return stats
-
-# ---------------------------------------------------------------- display
-
-def team_label(team: str, score: dict) -> str:
-    """'team A (started T, 7 rounds)' -- more use than a bare letter."""
-    wins = score.get("wins", {}).get(team, "?")
-    by_round = score.get("a_side_by_round", {})
-    first = by_round.get(min(by_round)) if by_round else None
-    if first:
-        started = first if team == "A" else ("CT" if first == "T" else "T")
-        return f"team {team}  (started {started}, {wins} rounds)"
-    return f"team {team}  ({wins} rounds)"
-
-
-def render_roster(players: pd.DataFrame, score: dict) -> None:
-    """Teams and names only. Used when statistics are unavailable."""
-    for team in ("A", "B"):
-        block = players[players["team"] == team]
-        if block.empty:
-            continue
-        print(f"\n{team_label(team, score)}")
-        print(f"  {'player':<20s} {'ended':>5s} {'MVP':>4s}")
-        print("  " + "-" * 31)
-        for _, r in block.iterrows():
-            mvp = "" if pd.isna(r["mvps"]) else f"{int(r['mvps']):d}"
-            flag = " *" if r["left_early"] else ""
-            print(f"  {str(r['name'])[:20]:<20s} "
-                  f"{str(r['final_side'] or '?'):>5s} {mvp:>4s}{flag}")
-
-    _render_notes(players)
-
-
-def render(stats: pd.DataFrame, players: pd.DataFrame, score: dict) -> None:
-    merged = players.merge(stats, left_on="steamid", right_index=True,
-                           how="left")
-
-    needed = ["kills", "deaths", "assists", "damage", "adr", "hs_pct"]
-    missing = [c for c in needed if c not in merged.columns]
-    if missing:
-        print(f"\ncompute_player_stats did not return: {missing}")
-        print("falling back to roster view")
-        render_roster(players, score)
-        return
-
-    for col in needed:
-        merged[col] = merged[col].fillna(0)
-
-    header = (f"  {'player':<20s} {'K':>4s} {'D':>4s} {'A':>4s} "
-              f"{'ADR':>7s} {'HS%':>6s} {'MVP':>4s}")
-
-    for team in ("A", "B"):
-        block = merged[merged["team"] == team]
-        if block.empty:
-            continue
-        print(f"\n{team_label(team, score)}")
-        print(header)
-        print("  " + "-" * (len(header) - 2))
-
-        block = block.sort_values(["kills", "damage"], ascending=False)
-        for _, r in block.iterrows():
-            mvp = "" if pd.isna(r["mvps"]) else f"{int(r['mvps']):d}"
-            flag = " *" if r["left_early"] else ""
-            print(f"  {str(r['name'])[:20]:<20s} "
-                  f"{int(r['kills']):>4d} {int(r['deaths']):>4d} "
-                  f"{int(r['assists']):>4d} {r['adr']:>7.1f} "
-                  f"{r['hs_pct']:>5.1f}% {mvp:>4s}{flag}")
-
-    _render_notes(merged)
-
-
-def _render_notes(df: pd.DataFrame) -> None:
-    unassigned = df[df["team"].isna()]
-    if not unassigned.empty:
-        print(f"\nunassigned to a team: {list(unassigned['name'])}")
-    if df["left_early"].any():
-        print("\n* not present at the final round")
-
-
-# ---------------------------------------------------------------- main
-
-def find_demo(stem: str) -> Path | None:
-    exact = EXTRACTED / f"{stem}.dem"
-    if exact.exists():
-        return exact
-    matches = [d for d in sorted(EXTRACTED.glob("*.dem")) if stem in d.stem]
-    if len(matches) == 1:
-        return matches[0]
-    print(f"{stem!r} is ambiguous" if matches else f"no demo matching {stem!r}")
-    print("available:")
-    for d in sorted(EXTRACTED.glob("*.dem")):
-        print(f"  {d.stem}")
-    return None
-
+ROOT = Path(__file__).resolve().parents[1]
+DB_PATH = ROOT / "data" / "csstats.db"
+
+
+# ------------------------------------------------------------------- queries
+
+MATCH_LIST = """
+SELECT m.match_id, m.map_name, m.rounds, m.demo_filename
+FROM matches m
+ORDER BY CAST(m.match_id AS INTEGER) DESC
+"""
+
+# Round wins per roster. round_end.winner is a SIDE, so it must be joined
+# against each player's side in that round to attribute a win to a team.
+TEAM_SCORE = """
+WITH round_sides AS (
+    SELECT r.round_number, r.winner_side, mp.team
+    FROM rounds r
+    JOIN player_rounds pr
+      ON pr.match_id = r.match_id AND pr.round_number = r.round_number
+     AND pr.side = r.winner_side
+    JOIN match_players mp
+      ON mp.match_id = pr.match_id AND mp.steamid = pr.steamid
+    WHERE r.match_id = :mid
+)
+SELECT team, COUNT(DISTINCT round_number) AS wins
+FROM round_sides
+GROUP BY team
+"""
+
+SCOREBOARD = """
+WITH me AS (
+    SELECT steamid, name, team, started_side, mvps, rounds_present, left_early
+    FROM match_players WHERE match_id = :mid
+),
+k AS (
+    SELECT attacker_steamid AS steamid,
+           COUNT(*) AS kills,
+           SUM(headshot) AS hs,
+           SUM(CASE WHEN penetrated > 0 THEN 1 ELSE 0 END) AS wallbang,
+           SUM(thrusmoke) AS smoke_kills,
+           SUM(noscope) AS noscope,
+           SUM(attackerblind) AS blind_kills
+    FROM kills
+    WHERE match_id = :mid AND exclusion IS NULL
+    GROUP BY attacker_steamid
+),
+d AS (
+    SELECT victim_steamid AS steamid, COUNT(*) AS deaths
+    FROM kills WHERE match_id = :mid
+    GROUP BY victim_steamid
+),
+a AS (
+    SELECT assister_steamid AS steamid,
+           COUNT(*) AS assists,
+           SUM(assistedflash) AS flash_assists
+    FROM kills
+    WHERE match_id = :mid AND assister_steamid IS NOT NULL
+      AND assister_side <> victim_side
+    GROUP BY assister_steamid
+),
+dmg AS (
+    SELECT attacker_steamid AS steamid,
+           SUM(dmg_health) AS raw_dmg,
+           SUM(MIN(dmg_health, victim_health)) AS clamped_dmg,
+           SUM(dmg_armor) AS armor_dmg,
+           COUNT(*) AS hits
+    FROM damage
+    WHERE match_id = :mid AND exclusion IS NULL
+    GROUP BY attacker_steamid
+),
+taken AS (
+    SELECT victim_steamid AS steamid,
+           SUM(MIN(dmg_health, victim_health)) AS dmg_taken
+    FROM damage WHERE match_id = :mid AND exclusion IS NULL
+    GROUP BY victim_steamid
+),
+util AS (
+    SELECT attacker_steamid AS steamid,
+           SUM(MIN(dmg_health, victim_health)) AS util_dmg
+    FROM damage
+    WHERE match_id = :mid AND exclusion IS NULL
+      AND weapon IN ('hegrenade', 'molotov', 'incgrenade', 'inferno',
+                     'flashbang', 'decoy')
+    GROUP BY attacker_steamid
+)
+SELECT me.steamid, me.name, me.team, me.started_side, me.mvps,
+       me.rounds_present, me.left_early,
+       COALESCE(k.kills, 0)         AS kills,
+       COALESCE(d.deaths, 0)        AS deaths,
+       COALESCE(a.assists, 0)       AS assists,
+       COALESCE(a.flash_assists, 0) AS flash_assists,
+       COALESCE(k.hs, 0)            AS hs,
+       COALESCE(k.wallbang, 0)      AS wallbang,
+       COALESCE(k.smoke_kills, 0)   AS smoke_kills,
+       COALESCE(k.blind_kills, 0)   AS blind_kills,
+       COALESCE(dmg.raw_dmg, 0)     AS raw_dmg,
+       COALESCE(dmg.clamped_dmg, 0) AS clamped_dmg,
+       COALESCE(dmg.hits, 0)        AS hits,
+       COALESCE(taken.dmg_taken, 0) AS dmg_taken,
+       COALESCE(util.util_dmg, 0)   AS util_dmg
+FROM me
+LEFT JOIN k     ON k.steamid     = me.steamid
+LEFT JOIN d     ON d.steamid     = me.steamid
+LEFT JOIN a     ON a.steamid     = me.steamid
+LEFT JOIN dmg   ON dmg.steamid   = me.steamid
+LEFT JOIN taken ON taken.steamid = me.steamid
+LEFT JOIN util  ON util.steamid  = me.steamid
+"""
+
+# First kill and first death of each round -> opening duels.
+OPENING = """
+WITH firsts AS (
+    SELECT round_number, MIN(tick) AS tick
+    FROM kills WHERE match_id = :mid AND round_number IS NOT NULL
+    GROUP BY round_number
+)
+SELECT k.attacker_steamid, k.victim_steamid, k.round_number,
+       r.winner_side, k.attacker_side
+FROM kills k
+JOIN firsts f ON f.round_number = k.round_number AND f.tick = k.tick
+LEFT JOIN rounds r ON r.match_id = k.match_id
+                  AND r.round_number = k.round_number
+WHERE k.match_id = :mid AND k.exclusion IS NULL
+"""
+
+# Per-round kill counts, for multikills and a sparkline.
+PER_ROUND = """
+SELECT attacker_steamid, round_number, COUNT(*) AS kills
+FROM kills
+WHERE match_id = :mid AND exclusion IS NULL AND round_number IS NOT NULL
+GROUP BY attacker_steamid, round_number
+"""
+
+SIDE_SPLIT = """
+SELECT k.attacker_steamid, k.attacker_side, COUNT(*) AS kills
+FROM kills k
+WHERE k.match_id = :mid AND k.exclusion IS NULL
+  AND k.attacker_side IS NOT NULL
+GROUP BY k.attacker_steamid, k.attacker_side
+"""
+
+WEAPONS = """
+SELECT weapon, COUNT(*) AS kills, SUM(headshot) AS hs
+FROM kills
+WHERE match_id = :mid AND exclusion IS NULL AND attacker_steamid = :sid
+GROUP BY weapon ORDER BY kills DESC
+"""
+
+ROUND_LOG = """
+SELECT round_number, winner_side, reason
+FROM rounds WHERE match_id = :mid ORDER BY round_number
+"""
+
+EXCLUSIONS = """
+SELECT exclusion, COUNT(*) FROM kills
+WHERE match_id = :mid AND exclusion IS NOT NULL GROUP BY exclusion
+"""
+
+
+# ------------------------------------------------------------------- helpers
+
+BLOCKS = " ▁▂▃▄▅▆▇█"
+
+
+def spark(values: list[int]) -> str:
+    if not values:
+        return ""
+    hi = max(values)
+    if hi == 0:
+        return BLOCKS[0] * len(values)
+    return "".join(BLOCKS[min(8, round(v / hi * 8))] for v in values)
+
+
+def connect() -> sqlite3.Connection:
+    if not DB_PATH.exists():
+        print(f"no database at {DB_PATH}")
+        print("run spike/extract.py first")
+        sys.exit(1)
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+# --------------------------------------------------------------------- views
+
+def list_matches(conn) -> list[sqlite3.Row]:
+    rows = conn.execute(MATCH_LIST).fetchall()
+    if not rows:
+        print("no matches in the database -- run spike/extract.py")
+        sys.exit(1)
+
+    print("\nmatches (newest first)")
+    for i, r in enumerate(rows, start=1):
+        print(f"  [{r['match_id']}] - {i}"
+              f"    {r['map_name'] or '?':<12s} {r['rounds']:>2d} rounds")
+    return rows
+
+
+def show_match(conn, mid: str) -> None:
+    args = {"mid": mid}
+    m = conn.execute("SELECT * FROM matches WHERE match_id = ?",
+                     (mid,)).fetchone()
+
+    print(f"\n{'=' * 66}")
+    print(f"match {mid}   {m['map_name']}   {m['rounds']} rounds")
+    print(f"patch {m['patch_version']}   rounds numbered via "
+          f"{m['round_source']}")
+
+    # ---- score, per roster
+    wins = {r["team"]: r["wins"] for r in conn.execute(TEAM_SCORE, args)}
+    board = conn.execute(SCOREBOARD, args).fetchall()
+    n_rounds = m["rounds"]
+
+    # ---- opening duels
+    open_k, open_d, open_k_won = {}, {}, {}
+    for r in conn.execute(OPENING, args):
+        open_k[r["attacker_steamid"]] = open_k.get(r["attacker_steamid"], 0) + 1
+        open_d[r["victim_steamid"]] = open_d.get(r["victim_steamid"], 0) + 1
+        if r["winner_side"] == r["attacker_side"]:
+            open_k_won[r["attacker_steamid"]] = \
+                open_k_won.get(r["attacker_steamid"], 0) + 1
+
+    # ---- per-round kills: multikills and shape
+    per_round = {}
+    for r in conn.execute(PER_ROUND, args):
+        per_round.setdefault(r["attacker_steamid"], {})[
+            r["round_number"]] = r["kills"]
+
+    # ---- side splits
+    split = {}
+    for r in conn.execute(SIDE_SPLIT, args):
+        split.setdefault(r["attacker_steamid"], {})[
+            r["attacker_side"]] = r["kills"]
+
+    by_team = {}
+    for row in board:
+        by_team.setdefault(row["team"], []).append(row)
+
+    for team in sorted(by_team, key=lambda t: -wins.get(t, 0)):
+        players = sorted(by_team[team], key=lambda r: -r["kills"])
+        started = players[0]["started_side"] if players else "?"
+        print(f"\nteam {team}   {wins.get(team, 0)} rounds   "
+              f"(started {started})")
+        print(f"  {'player':<18s} {'K':>3s} {'D':>3s} {'A':>3s} "
+              f"{'+/-':>4s} {'ADR':>6s} {'ADR*':>6s} {'HS%':>5s} "
+              f"{'KPR':>5s} {'MVP':>3s}  {'rounds':<20s}")
+        print("  " + "-" * 84)
+
+        for r in players:
+            k, d = r["kills"], r["deaths"]
+            rounds = r["rounds_present"] or n_rounds
+            adr_raw = r["raw_dmg"] / max(rounds, 1)
+            adr_cl = r["clamped_dmg"] / max(rounds, 1)
+            hs_pct = (r["hs"] / k * 100) if k else 0.0
+            shape = [per_round.get(r["steamid"], {}).get(i, 0)
+                     for i in range(1, n_rounds + 1)]
+            flag = "*" if r["left_early"] else " "
+            print(f"  {(r['name'] or '?')[:18]:<18s} "
+                  f"{k:>3d} {d:>3d} {r['assists']:>3d} "
+                  f"{k - d:>+4d} {adr_raw:>6.1f} {adr_cl:>6.1f} "
+                  f"{hs_pct:>4.0f}% {k / max(rounds, 1):>5.2f} "
+                  f"{(r['mvps'] or 0):>3d}  {spark(shape):<20s}{flag}")
+
+    # ---- detail per player
+    print(f"\n{'-' * 66}\ndetail")
+    print(f"  {'player':<18s} {'open K':>6s} {'open D':>6s} {'oK win':>7s} "
+          f"{'CT/T':>9s} {'2K':>3s} {'3K':>3s} {'4K':>3s} {'5K':>3s} "
+          f"{'util':>5s} {'flash':>6s} {'taken':>6s}")
+    print("  " + "-" * 92)
+    for r in sorted(board, key=lambda r: -r["kills"]):
+        sid_ = r["steamid"]
+        rk = per_round.get(sid_, {})
+        multi = {n: sum(1 for v in rk.values() if v == n) for n in (2, 3, 4, 5)}
+        s = split.get(sid_, {})
+        ok = open_k.get(sid_, 0)
+        won = open_k_won.get(sid_, 0)
+        print(f"  {(r['name'] or '?')[:18]:<18s} "
+              f"{ok:>6d} {open_d.get(sid_, 0):>6d} "
+              f"{(f'{won / ok * 100:.0f}%' if ok else '-'):>7s} "
+              f"{f'{s.get(chr(67) + chr(84), 0)}/{s.get(chr(84), 0)}':>9s} "
+              f"{multi[2]:>3d} {multi[3]:>3d} {multi[4]:>3d} {multi[5]:>3d} "
+              f"{r['util_dmg']:>5d} {r['flash_assists']:>6d} "
+              f"{r['dmg_taken']:>6d}")
+
+    # ---- round log
+    print(f"\n{'-' * 66}\nrounds")
+    log = conn.execute(ROUND_LOG, args).fetchall()
+    for i in range(0, len(log), 5):
+        chunk = log[i:i + 5]
+        print("  " + "   ".join(
+            f"{r['round_number']:>2d} {r['winner_side']:<2s} "
+            f"{(r['reason'] or '')[:14]:<14s}" for r in chunk))
+
+    exc = conn.execute(EXCLUSIONS, args).fetchall()
+    if exc:
+        print(f"\nexcluded kills: "
+              f"{ {r['exclusion']: r[1] for r in exc} }")
+
+    print("\nADR  = raw dmg_health / rounds")
+    print("ADR* = clamped to victim remaining health / rounds  <- likely correct")
+    if any(r["left_early"] for r in board):
+        print("*    = not present at the final round")
+
+
+# ---------------------------------------------------------------------- main
 
 def main() -> int:
-    path = find_demo(sys.argv[1] if len(sys.argv) > 1 else DEFAULT_DEMO)
-    if path is None:
-        return 1
-
-    print(f"{path.name}")
-
-    try:
-        data = load(path)
-    except Exception as err:
-        print(f"  parse failed: {err!r}")
-        return 1
-
-    rounds = data["rounds"]
-    if not hasattr(rounds, "columns") or rounds.empty:
-        print("  no round_end data -- cannot resolve rounds or score")
-        return 1
-
-    n_rounds = len(rounds)
-    print(f"  rounds played: {n_rounds}")
-
-    if "reason" in rounds.columns:
-        print(f"  round_end reasons: "
-              f"{rounds['reason'].value_counts().to_dict()}")
-    if "winner" in rounds.columns:
-        print(f"  wins by SIDE (not a score): "
-              f"{rounds['winner'].value_counts().to_dict()}")
-
-    try:
-        sides = side_table(data["parser"], rounds)
-        team_of = resolve_teams(sides)
-        score = match_score(rounds, sides, team_of) if team_of else {}
-        players = roster(sides, team_of)
-    except Exception as err:
-        print(f"  team resolution failed: {err!r}")
-        return 1
-
-    if players.empty:
-        print("  no players found")
-        return 1
-
-    kills = clean(data["kills"], n_rounds, "kills")
-    hurt = clean(data["hurt"], n_rounds, "hurt")
-
-    try:
-        stats = compute_player_stats(kills, hurt, players, n_rounds)
-    except NotImplementedError as err:
-        print(f"\n[stats not implemented: {err}]")
-        render_roster(players, score)
+    if "--sql" in sys.argv:
+        for name, q in (("MATCH_LIST", MATCH_LIST), ("TEAM_SCORE", TEAM_SCORE),
+                        ("SCOREBOARD", SCOREBOARD), ("OPENING", OPENING),
+                        ("PER_ROUND", PER_ROUND), ("SIDE_SPLIT", SIDE_SPLIT)):
+            print(f"\n-- {name}{q}")
         return 0
-    except Exception as err:
-        print(f"\ncompute_player_stats raised {err!r}")
-        render_roster(players, score)
+
+    conn = connect()
+    rows = list_matches(conn)
+
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    if args:
+        choice = args[0]
+    else:
+        try:
+            choice = input("\nwhich match do you want to choose : ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return 0
+
+    if not choice:
+        return 0
+
+    match = None
+    if choice.isdigit() and 1 <= int(choice) <= len(rows):
+        match = rows[int(choice) - 1]
+    else:
+        for r in rows:
+            if r["match_id"] == choice or choice in r["match_id"]:
+                match = r
+                break
+
+    if match is None:
+        print(f"no match for {choice!r}")
         return 1
 
-    render(stats, players, score)
+    show_match(conn, match["match_id"])
+    conn.close()
     return 0
 
 

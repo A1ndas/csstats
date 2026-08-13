@@ -11,6 +11,7 @@ build/
 *.db-shm
 session_state/
 data/
+spike/
 
 *.dem
 *.dem.bz2
