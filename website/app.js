@@ -23,6 +23,13 @@ function fmt(v, digits = 0) {
   return digits ? v.toFixed(digits) : String(v);
 }
 
+function fmtDate(iso) {
+  if (!iso) return "";
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "";
+  return d.toLocaleDateString(undefined, { month: "short", day: "numeric" });
+}
+
 async function api(path) {
   const res = await fetch(path);
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
@@ -46,7 +53,18 @@ function renderSidebar() {
 
     const mid = el("div");
     mid.append(el("div", "match-map", m.map_name || "unknown"));
-    mid.append(el("div", "match-sub", `${m.rounds} rounds · #${i + 1}`));
+    mid.append(el("div", "match-sub",
+      `${m.rounds} rounds · ${fmtDate(m.parsed_at)} · #${i + 1}`));
+
+    if (Array.isArray(m.wins_seq)) {
+      const spark = el("div", "sparkline");
+      m.wins_seq.forEach((t, idx) => {
+        const dot = el("i", t && t === m.winner ? "on" : "");
+        dot.title = `round ${idx + 1}: team ${t || "?"} won`;
+        spark.append(dot);
+      });
+      mid.append(spark);
+    }
     li.append(mid);
 
     li.append(el("div", "match-score", `${hi}–${lo}`));
@@ -103,6 +121,7 @@ function renderMatch(d) {
   sb.textContent = loser ? d.wins[loser] ?? 0 : 0;
   sa.classList.add("win");
   sb.classList.add("loss");
+  F("team-a").classList.add("win");
 
   renderTimeline(F("timeline"), d, winner);
   renderTiles(F("tiles"), d);
@@ -172,6 +191,7 @@ function renderTiles(node, d) {
 
 function renderTeams(node, d, teams) {
   const adrKey = state.adrMode === "raw" ? "adr_raw" : "adr";
+  const scroll = el("div", "table-scroll");
 
   teams.forEach((team) => {
     const members = d.players
@@ -184,7 +204,7 @@ function renderTeams(node, d, teams) {
     head.append(el("span", null,
       `Team ${team} · started ${members[0].started_side || "?"}`));
     head.append(el("span", "team-wins", `${d.wins[team] ?? 0} rounds`));
-    node.append(head);
+    scroll.append(head);
 
     const table = el("table");
     table.innerHTML = `<thead><tr>
@@ -232,8 +252,10 @@ function renderTeams(node, d, teams) {
     });
 
     table.append(tb);
-    node.append(table);
+    scroll.append(table);
   });
+
+  node.append(scroll);
 }
 
 function shape(perRound) {
@@ -282,7 +304,9 @@ function renderDetail(node, d) {
   });
 
   table.append(tb);
-  node.append(table);
+  const scroll = el("div", "table-scroll");
+  scroll.append(table);
+  node.append(scroll);
 }
 
 function renderRounds(node, d, winner) {

@@ -4,6 +4,11 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>csstats</title>
+<meta name="theme-color" content="#0b0d13">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='0' x2='1' y2='1'%3E%3Cstop offset='0' stop-color='%237c5cff'/%3E%3Cstop offset='1' stop-color='%234a9eff'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect width='32' height='32' rx='8' fill='url(%23g)'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
@@ -28,48 +33,54 @@
 </main>
 
 <template id="tpl-match">
-  <header class="match-head">
-    <div class="match-head-top">
-      <div>
-        <div class="eyebrow" data-f="eyebrow"></div>
-        <h1 class="map" data-f="map"></h1>
+  <article class="match">
+    <header class="hero">
+      <div class="hero-top">
+        <div class="hero-title">
+          <div class="eyebrow" data-f="eyebrow"></div>
+          <h1 class="map" data-f="map"></h1>
+        </div>
+        <div class="scoreline">
+          <div class="scoreline-side">
+            <span class="score-team" data-f="team-a"></span>
+            <span class="score" data-f="score-a"></span>
+          </div>
+          <span class="score-sep">:</span>
+          <div class="scoreline-side">
+            <span class="score" data-f="score-b"></span>
+            <span class="score-team" data-f="team-b"></span>
+          </div>
+        </div>
       </div>
-      <div class="scoreline">
-        <span class="score-team" data-f="team-a"></span>
-        <span class="score" data-f="score-a"></span>
-        <span class="score-sep">:</span>
-        <span class="score" data-f="score-b"></span>
-        <span class="score-team" data-f="team-b"></span>
+      <div class="timeline" data-f="timeline"></div>
+    </header>
+
+    <section class="tiles" data-f="tiles"></section>
+
+    <section class="panel">
+      <div class="panel-head">
+        <h2>Scoreboard</h2>
+        <div class="toggle">
+          <button class="toggle-btn is-on" data-adr="clamped">ADR clamped</button>
+          <button class="toggle-btn" data-adr="raw">ADR raw</button>
+        </div>
       </div>
-    </div>
-    <div class="timeline" data-f="timeline"></div>
-  </header>
+      <div data-f="teams"></div>
+      <p class="note" data-f="adr-note"></p>
+    </section>
 
-  <section class="tiles" data-f="tiles"></section>
+    <section class="panel">
+      <div class="panel-head"><h2>Duels &amp; utility</h2></div>
+      <div data-f="detail"></div>
+    </section>
 
-  <section class="panel">
-    <div class="panel-head">
-      <h2>Scoreboard</h2>
-      <div class="toggle">
-        <button class="toggle-btn is-on" data-adr="clamped">ADR clamped</button>
-        <button class="toggle-btn" data-adr="raw">ADR raw</button>
-      </div>
-    </div>
-    <div data-f="teams"></div>
-    <p class="note" data-f="adr-note"></p>
-  </section>
+    <section class="panel">
+      <div class="panel-head"><h2>Round by round</h2></div>
+      <div data-f="rounds"></div>
+    </section>
 
-  <section class="panel">
-    <div class="panel-head"><h2>Duels &amp; utility</h2></div>
-    <div data-f="detail"></div>
-  </section>
-
-  <section class="panel">
-    <div class="panel-head"><h2>Round by round</h2></div>
-    <div data-f="rounds"></div>
-  </section>
-
-  <footer class="meta" data-f="meta"></footer>
+    <footer class="meta" data-f="meta"></footer>
+  </article>
 </template>
 
 <script src="app.js"></script>

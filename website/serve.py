@@ -52,6 +52,8 @@ def list_matches(conn) -> list[dict]:
             "rounds": r["rounds"],
             "patch_version": r["patch_version"],
             "score": (ordered + [0])[:2],
+            "winner": max(score, key=score.get) if score else None,
+            "wins_seq": round_winners(conn, r["match_id"]),
         })
     return out
 
@@ -76,6 +78,28 @@ def team_wins(conn, mid: str) -> dict:
         GROUP BY mp.team
     """, (mid,)).fetchall()
     return {r["team"]: r["wins"] for r in rows}
+
+
+def round_winners(conn, mid: str) -> list[str]:
+    """Winning roster ('A'/'B') per round, in round order, or '' when
+    unassignable. Feeds the sidebar sparkline: a per-round record strip
+    relative to the match winner."""
+    rows = conn.execute("""
+        SELECT r.round_number, mp.team
+        FROM rounds r
+        JOIN player_rounds pr
+          ON pr.match_id = r.match_id
+         AND pr.round_number = r.round_number
+         AND pr.side = r.winner_side
+        JOIN match_players mp
+          ON mp.match_id = pr.match_id AND mp.steamid = pr.steamid
+        WHERE r.match_id = ?
+        GROUP BY r.round_number
+    """, (mid,)).fetchall()
+    by_round = {r["round_number"]: r["team"] for r in rows}
+    if not by_round:
+        return []
+    return [by_round.get(n, "") for n in range(1, max(by_round) + 1)]
 
 
 def match_detail(conn, mid: str) -> dict | None:
